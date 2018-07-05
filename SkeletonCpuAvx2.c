@@ -20,27 +20,22 @@
 #define k_TileCountY (k_DemoResolutionY / k_TileSize)
 #define k_TileCount (k_TileCountX * k_TileCountY)
 
-#define k_ThreadMaxCount 32
-
-typedef struct __declspec(align(64)) WorkerThread
+typedef struct JobData
 {
     uint8_t *displayPtr;
-    HANDLE handle;
-    HANDLE beginEvent;
-    HANDLE endEvent;
-} WorkerThread;
+} JobData;
 
 typedef struct Demo
 {
-    uint8_t *displayPtr;
     HWND window;
-    HDC windowDevCtx;
-    HDC memoryDevCtx;
-    uint32_t threadCount;
-    WorkerThread threads[k_ThreadMaxCount];
+    HDC windowDc;
+    HDC memoryDc;
+    uint32_t cpuCoreCount;
+    JobData job;
+    PTP_WORK jobHandle;
 } Demo;
 
-__declspec(align(64)) static uint32_t s_TileIndex[16];
+__declspec(align(64)) static volatile uint32_t s_TileIndex[16];
 
 static double
 GetTime(void)
@@ -62,7 +57,7 @@ UpdateFrameTime(HWND window, double *time, float *deltaTime)
 {
     static double lastTime = -1.0;
     static double lastFpsTime = 0.0;
-    static unsigned frameCount = 0;
+    static uint32_t frameCount = 0;
 
     if (lastTime < 0.0)
     {
@@ -76,8 +71,8 @@ UpdateFrameTime(HWND window, double *time, float *deltaTime)
 
     if ((*time - lastFpsTime) >= 1.0)
     {
-        const double fps = frameCount / (*time - lastFpsTime);
-        const double ms = (1.0 / fps) * 1000.0;
+        double fps = frameCount / (*time - lastFpsTime);
+        double ms = (1.0 / fps) * 1000.0;
         char text[256];
         snprintf(text, sizeof(text), "[%.1f fps  %.3f ms] %s", fps, ms, k_DemoName);
         SetWindowText(window, text);
@@ -129,8 +124,8 @@ InitializeWindow(Demo *demo)
         NULL, NULL, NULL, 0);
     assert(demo->window);
 
-    demo->windowDevCtx = GetDC(demo->window);
-    assert(demo->windowDevCtx);
+    demo->windowDc = GetDC(demo->window);
+    assert(demo->windowDc);
 
     BITMAPINFO bi = {
         .bmiHeader.biSize = sizeof(BITMAPINFOHEADER),
@@ -141,53 +136,54 @@ InitializeWindow(Demo *demo)
         .bmiHeader.biHeight = k_DemoResolutionY,
         .bmiHeader.biSizeImage = k_DemoResolutionX * k_DemoResolutionY
     };
-    HBITMAP hbm = CreateDIBSection(demo->windowDevCtx, &bi, DIB_RGB_COLORS, (void **)&demo->displayPtr, NULL, 0);
+    HBITMAP hbm = CreateDIBSection(demo->windowDc, &bi, DIB_RGB_COLORS, (void **)&demo->job.displayPtr, NULL, 0);
     assert(hbm);
 
-    demo->memoryDevCtx = CreateCompatibleDC(demo->windowDevCtx);
-    assert(demo->memoryDevCtx);
+    demo->memoryDc = CreateCompatibleDC(demo->windowDc);
+    assert(demo->memoryDc);
 
-    SelectObject(demo->memoryDevCtx, hbm);
+    SelectObject(demo->memoryDc, hbm);
 }
 
-static DWORD WINAPI
-DrawTilesThread(void *param)
+static void CALLBACK
+DrawTiles(PTP_CALLBACK_INSTANCE instance, void *context, PTP_WORK work)
 {
-    WorkerThread *thread = (WorkerThread *)param;
+    (void)instance;
+    (void)work;
+    JobData *data = (JobData *)context;
+    uint8_t *displayPtr = data->displayPtr;
 
     for (;;)
     {
-        WaitForSingleObject(thread->beginEvent, INFINITE);
+        uint32_t tileIndex = (uint32_t)_InterlockedIncrement((volatile LONG *)s_TileIndex) - 1;
+        if (tileIndex >= k_TileCount)
+            break;
 
-        //DrawTiles(thread.displayPtr, thread.zoom, thread.position[0], thread.position[1]);
+        uint32_t x0 = (tileIndex % k_TileCountX) * k_TileSize;
+        uint32_t y0 = (tileIndex / k_TileCountX) * k_TileSize;
+        uint32_t x1 = x0 + k_TileSize;
+        uint32_t y1 = y0 + k_TileSize;
 
-        SetEvent(thread->endEvent);
+        for (uint32_t y = y0; y < y1; ++y)
+        {
+            for (uint32_t x = x0; x < x1; x += 8)
+            {
+                uint32_t index = (x + y * k_DemoResolutionX) * 4;
+                _mm256_store_si256((__m256i *)&displayPtr[index], _mm256_set1_epi32(0xC0DEC0DE));
+            }
+        }
     }
 }
 
 static void
-InitializeWorkerThreads(Demo *demo)
+Initialize(Demo *demo)
 {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    demo->threadCount = (uint32_t)(si.dwNumberOfProcessors - 1);
+    demo->cpuCoreCount = (uint32_t)si.dwNumberOfProcessors;
 
-    for (uint32_t i = 0; i < demo->threadCount; ++i)
-    {
-        demo->threads[i].displayPtr = demo->displayPtr;
-        demo->threads[i].handle = NULL;
-        demo->threads[i].beginEvent = CreateEventEx(NULL, NULL, 0, EVENT_ALL_ACCESS);
-        demo->threads[i].endEvent = CreateEventEx(NULL, NULL, 0, EVENT_ALL_ACCESS);
-
-        assert(demo->threads[i].beginEvent);
-        assert(demo->threads[i].endEvent);
-    }
-
-    for (uint32_t i = 0; i < demo->threadCount; ++i)
-    {
-        demo->threads[i].handle = CreateThread(NULL, 0, DrawTilesThread, (void *)&demo->threads[i], 0, NULL);
-        assert(demo->threads[i].handle);
-    }
+    demo->jobHandle = CreateThreadpoolWork(DrawTiles, &demo->job, NULL);
+    assert(demo->jobHandle);
 }
 
 int
@@ -197,6 +193,7 @@ main(void)
 
     Demo demo = { 0 };
     InitializeWindow(&demo);
+    Initialize(&demo);
 
     for (;;)
     {
@@ -213,7 +210,14 @@ main(void)
             float deltaTime;
             UpdateFrameTime(demo.window, &time, &deltaTime);
 
-            BitBlt(demo.windowDevCtx, 0, 0, k_DemoResolutionX, k_DemoResolutionY, demo.memoryDevCtx, 0, 0, SRCCOPY);
+            s_TileIndex[0] = 0;
+
+            for (uint32_t i = 0; i < demo.cpuCoreCount; ++i)
+                SubmitThreadpoolWork(demo.jobHandle);
+
+            WaitForThreadpoolWorkCallbacks(demo.jobHandle, FALSE);
+
+            BitBlt(demo.windowDc, 0, 0, k_DemoResolutionX, k_DemoResolutionY, demo.memoryDc, 0, 0, SRCCOPY);
         }
     }
 
